@@ -1,4 +1,6 @@
-from typing import Any
+import asyncio
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Dict, Optional
 
 from fastapi.exceptions import FastAPIDeprecationWarning
 from starlette.responses import FileResponse as FileResponse  # noqa
@@ -82,3 +84,115 @@ class ORJSONResponse(JSONResponse):
         return orjson.dumps(
             content, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
         )
+
+
+@dataclass
+class SSEEvent:
+    """Server-Sent Event data structure.
+
+    Args:
+        data: The event data payload. If not a string, will be converted to string.
+        event: The event type identifier (optional).
+        id: The event identifier for Last-Event-ID header on reconnection (optional).
+        retry: Reconnection interval in milliseconds (optional).
+        comment: A comment line (starts with colon, used for keep-alive) (optional).
+    """
+
+    data: Any
+    event: Optional[str] = None
+    id: Optional[str] = None
+    retry: Optional[int] = None
+    comment: Optional[str] = None
+
+    def encode(self) -> bytes:
+        """Encode the SSE event according to the SSE specification."""
+        lines = []
+
+        if self.comment:
+            lines.append(f":{self.comment}")
+
+        if self.event is not None:
+            lines.append(f"event: {self.event}")
+
+        if self.id is not None:
+            lines.append(f"id: {self.id}")
+
+        if self.retry is not None:
+            lines.append(f"retry: {self.retry}")
+
+        # Data can be multiline - split with separate data: lines
+        data_str = str(self.data)
+        for line in data_str.split("\n"):
+            lines.append(f"data: {line}")
+
+        # End with double newline
+        return "\n".join(lines).encode("utf-8") + b"\n\n"
+
+
+class SSEResponse(StreamingResponse):
+    """Server-Sent Events response.
+
+    A streaming response that sends events in SSE format according to the
+    W3C Eventsource specification.
+
+    Args:
+        content: An async generator yielding SSEEvent objects.
+        status_code: HTTP status code (default: 200).
+        headers: Additional HTTP headers.
+        media_type: Media type (default: text/event-stream).
+        background: Background task to run after response completes.
+
+    Example:
+        ```python
+        from fastapi import FastAPI
+        from fastapi.responses import SSEResponse, SSEEvent
+
+        app = FastAPI()
+
+        async def event_generator():
+            for i in range(10):
+                yield SSEEvent(data=f"message {i}")
+                await asyncio.sleep(1)
+
+        @app.get("/events")
+        async def main():
+            return SSEResponse(event_generator())
+        ```
+    """
+
+    def __init__(
+        self,
+        content: AsyncGenerator["SSEEvent", None],
+        status_code: int = 200,
+        headers: Optional[Dict[str, str]] = None,
+        media_type: str = "text/event-stream",
+        background: Optional[Any] = None,
+    ) -> None:
+        # Set default headers for SSE
+        default_headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        if headers:
+            default_headers.update(headers)
+
+        super().__init__(
+            content=self._stream_events(content),
+            status_code=status_code,
+            headers=default_headers,
+            media_type=media_type,
+            background=background,
+        )
+
+    async def _stream_events(
+        self, content: AsyncGenerator["SSEEvent", None]
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream SSE events with proper disconnect handling and cleanup."""
+        try:
+            async for event in content:
+                yield event.encode()
+        except asyncio.CancelledError:
+            # Client disconnected - cleanup will happen in finally
+            raise
+        finally:
+            # Ensure generator is properly closed
+            if hasattr(content, "aclose"):
+                await content.aclose()
+
