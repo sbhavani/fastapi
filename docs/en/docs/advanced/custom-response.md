@@ -266,6 +266,14 @@ You can still override `response_class` in *path operations* as before.
 
 ///
 
+## Server-Sent Events (SSE) { #server-sent-events-sse }
+
+FastAPI provides support for Server-Sent Events (SSE) through the `SSEResponse` class and helper functions.
+
+### Using `SSEResponse`
+
+{* ../../docs_src/custom_response/tutorial011_py310.py hl[2,4,6,10,14,18,22,26,30,34,38,42] *}
+
 ## Additional documentation { #additional-documentation }
 
 You can also declare the media type and many other details in OpenAPI using `responses`: [Additional Responses in OpenAPI](additional-responses.md){.internal-link target=_blank}.
