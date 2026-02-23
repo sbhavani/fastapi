@@ -52,6 +52,16 @@ validation_error_definition = {
         "type": {"title": "Error Type", "type": "string"},
         "input": {"title": "Input"},
         "ctx": {"title": "Context", "type": "object"},
+        "suggestions": {
+            "title": "Suggestions",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Suggested field names that are similar to the error location",
+        },
+        "example": {
+            "title": "Example",
+            "description": "Example value that would be valid for this field",
+        },
     },
     "required": ["loc", "msg", "type"],
 }
