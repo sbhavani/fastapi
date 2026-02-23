@@ -6,6 +6,8 @@ from pydantic import BaseModel, create_model
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.exceptions import WebSocketException as StarletteWebSocketException
 
+from fastapi._error_utils import enhance_validation_errors
+
 
 class EndpointContext(TypedDict, total=False):
     function: str
@@ -177,9 +179,11 @@ class ValidationException(Exception):
         errors: Sequence[Any],
         *,
         endpoint_ctx: EndpointContext | None = None,
+        model_fields: dict[str, Any] | None = None,
     ) -> None:
         self._errors = errors
         self.endpoint_ctx = endpoint_ctx
+        self._model_fields = model_fields
 
         ctx = endpoint_ctx or {}
         self.endpoint_function = ctx.get("function")
@@ -189,6 +193,15 @@ class ValidationException(Exception):
 
     def errors(self) -> Sequence[Any]:
         return self._errors
+
+    def errors_with_suggestions(self) -> list[dict[str, Any]]:
+        """Return errors with enhanced suggestions and context."""
+        if self._model_fields:
+            return enhance_validation_errors(
+                list(self._errors),
+                model_fields=self._model_fields,
+            )
+        return enhance_validation_errors(list(self._errors))
 
     def _format_endpoint_context(self) -> str:
         if not (self.endpoint_file and self.endpoint_line and self.endpoint_function):

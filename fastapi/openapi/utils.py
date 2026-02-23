@@ -52,6 +52,20 @@ validation_error_definition = {
         "type": {"title": "Error Type", "type": "string"},
         "input": {"title": "Input"},
         "ctx": {"title": "Context", "type": "object"},
+        "path": {
+            "title": "Path",
+            "description": "Human-readable path to the field (e.g., 'body -> user -> name')",
+            "type": "string",
+        },
+        "suggestion": {
+            "title": "Suggestion",
+            "description": "Suggestion for fixing the error (e.g., 'Did you mean: field_name?')",
+            "type": "string",
+        },
+        "example": {
+            "title": "Example",
+            "description": "Example value that would be valid for this field",
+        },
     },
     "required": ["loc", "msg", "type"],
 }
