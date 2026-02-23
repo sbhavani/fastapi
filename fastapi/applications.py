@@ -1,10 +1,15 @@
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Generator, Sequence
+from contextlib import asynccontextmanager
 from enum import Enum
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     TypeVar,
 )
+
+if TYPE_CHECKING:
+    from fastapi.plugins import PluginProtocol
 
 from annotated_doc import Doc
 from fastapi import routing
@@ -960,13 +965,42 @@ class FastAPI(Starlette):
                 """
             ),
         ] = {}
+
+        # Wrap lifespan to include plugin hooks
+        @asynccontextmanager
+        async def lifespan_with_plugins(
+            app: AppType,
+        ) -> AsyncGenerator[None, None]:
+            # Import PluginManager
+            from fastapi.plugins import PluginManager
+
+            # Get or create plugin manager
+            plugin_manager: PluginManager | None = getattr(app, "plugin_manager", None)
+            if plugin_manager is None:
+                plugin_manager = PluginManager()
+                app.plugin_manager = plugin_manager
+
+            # If user provided a lifespan, use it as the base
+            if lifespan is not None:
+                async with lifespan(app):
+                    # Run plugin startup after entering user lifespan
+                    await plugin_manager.on_startup()
+                    yield
+                    # Run plugin shutdown before exiting user lifespan
+                    await plugin_manager.on_shutdown()
+            else:
+                # No user lifespan - just run plugin hooks
+                await plugin_manager.on_startup()
+                yield
+                await plugin_manager.on_shutdown()
+
         self.router: routing.APIRouter = routing.APIRouter(
             routes=routes,
             redirect_slashes=redirect_slashes,
             dependency_overrides_provider=self,
             on_startup=on_startup,
             on_shutdown=on_shutdown,
-            lifespan=lifespan,
+            lifespan=lifespan_with_plugins,
             default_response_class=default_response_class,
             dependencies=dependencies,
             callbacks=callbacks,
@@ -992,6 +1026,15 @@ class FastAPI(Starlette):
             [] if middleware is None else list(middleware)
         )
         self.middleware_stack: ASGIApp | None = None
+
+        # Plugin system
+        from fastapi.plugins import PluginManager, PluginMiddleware
+        from fastapi.types import PluginProtocol
+
+        self.plugin_manager: PluginManager = PluginManager()
+        self._plugins_middleware_added: bool = False
+        self._plugin_middleware: PluginMiddleware | None = None
+
         self.setup()
 
     def build_middleware_stack(self) -> ASGIApp:
@@ -1073,6 +1116,11 @@ class FastAPI(Starlette):
                 separate_input_output_schemas=self.separate_input_output_schemas,
                 external_docs=self.openapi_external_docs,
             )
+            # Extend schema with plugin contributions
+            if hasattr(self, "plugin_manager"):
+                self.openapi_schema = self.plugin_manager.extend_openapi_schema(
+                    self.openapi_schema
+                )
         return self.openapi_schema
 
     def setup(self) -> None:
@@ -4617,6 +4665,69 @@ class FastAPI(Starlette):
             return func
 
         return decorator
+
+    def add_plugin(self, plugin: "PluginProtocol") -> None:
+        """
+        Register a plugin with the FastAPI application.
+
+        Plugins are reusable components that can hook into the application
+        lifecycle and request processing. A plugin can implement any of the
+        following hooks:
+
+        - `on_startup`: Called when the application starts
+        - `on_shutdown`: Called when the application stops
+        - `before_request`: Called before each request is processed
+        - `after_request`: Called after each request is processed
+        - `get_openapi_schema`: Called to extend the OpenAPI schema
+
+        Read more about it in the
+        [FastAPI docs for Plugins](https://fastapi.tiangolo.com/advanced/plugins/).
+
+        ## Example
+
+        ```python
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+
+        class MyPlugin:
+            async def on_startup(self):
+                print("Starting up!")
+
+            async def on_shutdown(self):
+                print("Shutting down!")
+
+
+        app.add_plugin(MyPlugin())
+        ```
+
+        ## Args:
+            plugin: An object implementing the `PluginProtocol` interface.
+
+        ## Raises:
+            TypeError: If the plugin does not implement `PluginProtocol`.
+            ValueError: If a plugin with the same name is already registered.
+        """
+        from fastapi.plugins import PluginMiddleware
+
+        # Register the plugin
+        self.plugin_manager.add_plugin(plugin)
+
+        # Auto-add middleware if not already added and plugin has request hooks
+        from fastapi.plugins import get_plugin_middleware, _plugin_middleware_instance
+
+        if not self._plugins_middleware_added:
+            middleware_plugins = self.plugin_manager.get_middleware_plugins()
+            if middleware_plugins:
+                middleware_class = get_plugin_middleware(middleware_plugins)
+                self.add_middleware(middleware_class)  # type: ignore[arg-type]
+                self._plugins_middleware_added = True
+        else:
+            # Update existing middleware instance with new plugins
+            if _plugin_middleware_instance is not None:
+                middleware_plugins = self.plugin_manager.get_middleware_plugins()
+                _plugin_middleware_instance.plugins = middleware_plugins
 
     def exception_handler(
         self,
