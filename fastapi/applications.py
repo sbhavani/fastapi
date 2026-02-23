@@ -24,6 +24,7 @@ from fastapi.openapi.docs import (
 )
 from fastapi.openapi.utils import get_openapi
 from fastapi.params import Depends
+from fastapi.plugins import PluginProtocol, PluginRegistry
 from fastapi.types import DecoratedCallable, IncEx
 from fastapi.utils import generate_unique_id
 from starlette.applications import Starlette
@@ -975,6 +976,9 @@ class FastAPI(Starlette):
             responses=responses,
             generate_unique_id_function=generate_unique_id_function,
         )
+        self._plugins = PluginRegistry()
+        # Pass plugins reference to router for lifespan integration
+        self.router._plugins = self._plugins
         self.exception_handlers: dict[
             Any, Callable[[Request, Any], Response | Awaitable[Response]]
         ] = {} if exception_handlers is None else dict(exception_handlers)
@@ -1073,6 +1077,13 @@ class FastAPI(Starlette):
                 separate_input_output_schemas=self.separate_input_output_schemas,
                 external_docs=self.openapi_external_docs,
             )
+            # Merge plugin OpenAPI contributions
+            plugin_contributions = self._plugins.get_openapi_contributions()
+            if plugin_contributions:
+                from fastapi.plugins.utils import merge_openapi_schemas
+                self.openapi_schema = merge_openapi_schemas(
+                    self.openapi_schema, plugin_contributions
+                )
         return self.openapi_schema
 
     def setup(self) -> None:
@@ -1131,7 +1142,87 @@ class FastAPI(Starlette):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self.root_path:
             scope["root_path"] = self.root_path
+
+        # Only process plugins for HTTP requests (not websocket)
+        if scope["type"] == "http":
+            from starlette.requests import Request
+            from starlette.responses import Response
+
+            request = Request(scope, receive)
+
+            # Call before_request hooks
+            response = await self._plugins.before_request(request)
+            if response is not None:
+                # Short-circuit: return the response from plugin
+                await response(scope, receive, send)
+                # Call after_request hooks with the response
+                await self._plugins.after_request(request, response)
+                return
+
+            # Store request for after_request (will be modified in place)
+            response_started = False
+            response_status = 200
+            response_headers = []
+
+            async def wrapped_send(message: dict) -> None:
+                nonlocal response_started, response_status, response_headers
+                if message["type"] == "http.response.start":
+                    response_started = True
+                    response_status = message.get("status", 200)
+                    # Convert list of tuples to dict
+                    headers_list = message.get("headers", [])
+                    response_headers = {
+                        k.decode("latin-1"): v.decode("latin-1")
+                        for k, v in headers_list
+                    }
+                await send(message)
+
+            # Normal request processing
+            await super().__call__(scope, receive, wrapped_send)
+
+            # Create a response object for after_request
+            from starlette.responses import PlainTextResponse
+            response = PlainTextResponse(
+                content="",
+                status_code=response_status,
+                headers=response_headers,
+            )
+            # Call after_request hooks
+            await self._plugins.after_request(request, response)
+            return
+
+        # For non-HTTP requests (websocket, etc.), just pass through
         await super().__call__(scope, receive, send)
+
+    @property
+    def plugins(self) -> PluginRegistry:
+        """The plugin registry for this application."""
+        return self._plugins
+
+    def add_plugin(self, plugin: PluginProtocol) -> None:
+        """Register a plugin with the application.
+
+        Args:
+            plugin: A plugin instance implementing the PluginProtocol.
+
+        Example:
+
+        ```python
+        from fastapi import FastAPI
+        from fastapi.plugins import PluginProtocol
+
+        class MyPlugin:
+            async def on_startup(self) -> None:
+                print("Starting up!")
+
+            async def on_shutdown(self) -> None:
+                print("Shutting down!")
+
+        app = FastAPI()
+        app.add_plugin(MyPlugin())
+        ```
+        """
+        self._plugins.add(plugin)
 
     def add_api_route(
         self,
