@@ -10,3 +10,6 @@ DecoratedCallable = TypeVar("DecoratedCallable", bound=Callable[..., Any])
 UnionType = getattr(types, "UnionType", Union)
 ModelNameMap = dict[type[BaseModel] | type[Enum], str]
 DependencyCacheKey = tuple[Callable[..., Any] | None, tuple[str, ...], str]
+
+# Plugin types
+from fastapi.plugins import PluginProtocol as PluginProtocol
