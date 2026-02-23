@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager
 from enum import Enum
 from typing import (
     Annotated,
@@ -15,6 +16,7 @@ from fastapi.exception_handlers import (
     websocket_request_validation_exception_handler,
 )
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
+from fastapi.plugins import PluginManager, PluginProtocol, get_plugin_manager
 from fastapi.logger import logger
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
 from fastapi.openapi.docs import (
@@ -36,10 +38,58 @@ from starlette.middleware.exceptions import ExceptionMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import BaseRoute
-from starlette.types import ASGIApp, ExceptionHandler, Lifespan, Receive, Scope, Send
+from starlette.types import ASGIApp, ExceptionHandler, Lifespan, Message, Receive, Scope, Send
 from typing_extensions import deprecated
 
 AppType = TypeVar("AppType", bound="FastAPI")
+
+
+class PluginMiddleware:
+    """
+    ASGI Middleware that executes plugin before_request and after_request hooks.
+
+    This middleware is automatically added when plugins with request hooks
+    are registered with the application.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Create request object
+        request = Request(scope, receive)
+
+        # Get the plugin manager from the app
+        plugin_manager: PluginManager | None = scope.get("app").__dict__.get("_plugin_manager")  # type: ignore[union-attr]
+
+        # Execute before_request hooks
+        if plugin_manager:
+            await plugin_manager.before_request(request)
+
+        # Create a custom send function to capture the response
+        status_code = 200
+        response_headers: list[tuple[str, str]] = []
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                status_code = message.get("status_code", 200)
+                response_headers = list(message.get("headers", []))
+            await send(message)
+
+        # Process the request
+        await self.app(scope, receive, send_wrapper)
+
+        # Create a response object for the after_request hook
+        if plugin_manager:
+            response = Response(
+                status_code=status_code,
+                headers=dict(response_headers),
+            )
+            await plugin_manager.after_request(request, response)
 
 
 class FastAPI(Starlette):
@@ -991,6 +1041,18 @@ class FastAPI(Starlette):
         self.user_middleware: list[Middleware] = (
             [] if middleware is None else list(middleware)
         )
+
+        # Initialize plugin manager
+        self._plugin_manager: PluginManager = PluginManager(self)
+
+        # Add plugin middleware for before_request/after_request hooks
+        self.user_middleware.append(Middleware(PluginMiddleware))
+
+        # Override router's lifespan to include plugin hooks
+        # Store the original lifespan first to avoid infinite recursion
+        original_lifespan = self.router.lifespan_context
+        self.router.lifespan_context = self._create_plugin_lifespan(original_lifespan)
+
         self.middleware_stack: ASGIApp | None = None
         self.setup()
 
@@ -1073,6 +1135,10 @@ class FastAPI(Starlette):
                 separate_input_output_schemas=self.separate_input_output_schemas,
                 external_docs=self.openapi_external_docs,
             )
+            # Allow plugins to modify the OpenAPI schema
+            self.openapi_schema = self._plugin_manager.on_openapi_schema(
+                self.openapi_schema
+            )
         return self.openapi_schema
 
     def setup(self) -> None:
@@ -1127,6 +1193,103 @@ class FastAPI(Starlette):
                 )
 
             self.add_route(self.redoc_url, redoc_html, include_in_schema=False)
+
+    def register_plugin(self, plugin: PluginProtocol) -> PluginProtocol:
+        """
+        Register a plugin with the FastAPI application.
+
+        Plugins can implement lifecycle hooks:
+        - `on_startup`: Called when the application starts
+        - `on_shutdown`: Called when the application shuts down
+        - `before_request`: Called before each request is processed
+        - `after_request`: Called after each request is processed
+        - `on_openapi_schema`: Called during OpenAPI schema generation
+
+        Args:
+            plugin: An instance of a class implementing PluginProtocol.
+
+        Returns:
+            The registered plugin instance (for chaining).
+
+        ## Example
+
+        ```python
+        from fastapi import FastAPI
+        from fastapi.plugins import PluginProtocol
+
+        class MyPlugin(PluginProtocol):
+            async def on_startup(self, app: FastAPI) -> None:
+                print("App starting!")
+
+        app = FastAPI()
+        app.register_plugin(MyPlugin())
+        ```
+
+        Read more about plugins in the
+        [FastAPI docs for Plugins](https://fastapi.tiangolo.com/how-to/plugins/).
+        """
+        plugin_manager = get_plugin_manager(self)
+        plugin_manager.register(plugin)
+        return plugin
+
+    @property
+    def plugin_manager(self) -> PluginManager:
+        """
+        Get the plugin manager for this application.
+
+        Returns:
+            The PluginManager instance for this application.
+        """
+        return get_plugin_manager(self)
+
+    @asynccontextmanager
+    async def plugin_lifespan(self, app: "FastAPI") -> None:
+        """
+        Plugin-aware lifespan context manager.
+
+        This wraps the router's lifespan to also call plugin startup/shutdown hooks.
+        """
+        # Run plugin startup hooks
+        await self._plugin_manager.on_startup()
+
+        try:
+            # Run the router's lifespan (which runs on_startup/on_shutdown handlers)
+            async with self.router.lifespan_context(app):
+                yield
+        finally:
+            # Run plugin shutdown hooks
+            await self._plugin_manager.on_shutdown()
+
+    def _create_plugin_lifespan(
+        self, original_lifespan: Lifespan[AppType]
+    ) -> Lifespan[AppType]:
+        """
+        Create a lifespan context manager that includes plugin hooks.
+
+        This wraps the router's original lifespan to add plugin startup/shutdown
+        hook execution.
+
+        Args:
+            original_lifespan: The original router lifespan context manager.
+
+        Returns:
+            A new lifespan context manager that includes plugin hooks.
+        """
+
+        @asynccontextmanager
+        async def lifespan_wrapper(app: AppType) -> None:
+            # Run plugin startup hooks
+            await self._plugin_manager.on_startup()
+
+            try:
+                # Run the router's original lifespan
+                async with original_lifespan(app):
+                    yield
+            finally:
+                # Run plugin shutdown hooks
+                await self._plugin_manager.on_shutdown()
+
+        return lifespan_wrapper
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self.root_path:
