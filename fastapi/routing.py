@@ -224,8 +224,14 @@ class _DefaultLifespan:
 
     async def __aenter__(self) -> None:
         await self._router._startup()
+        # Call plugin startup hooks if available
+        if hasattr(self._router, "_plugins"):
+            await self._router._plugins.on_startup()
 
     async def __aexit__(self, *exc_info: object) -> None:
+        # Call plugin shutdown hooks if available (in reverse order)
+        if hasattr(self._router, "_plugins"):
+            await self._router._plugins.on_shutdown()
         await self._router._shutdown()
 
     def __call__(self: _T, app: object) -> _T:
