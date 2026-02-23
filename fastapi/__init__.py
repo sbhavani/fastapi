@@ -18,6 +18,9 @@ from .param_functions import Header as Header
 from .param_functions import Path as Path
 from .param_functions import Query as Query
 from .param_functions import Security as Security
+from .plugins import PluginManager as PluginManager
+from .plugins import PluginProtocol as PluginProtocol
+from .plugins import get_plugin_manager as get_plugin_manager
 from .requests import Request as Request
 from .responses import Response as Response
 from .routing import APIRouter as APIRouter
