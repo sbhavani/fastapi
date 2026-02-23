@@ -24,6 +24,14 @@ from fastapi.openapi.docs import (
 )
 from fastapi.openapi.utils import get_openapi
 from fastapi.params import Depends
+from fastapi.plugin import (
+    Plugin,
+    PluginMiddleware,
+    PluginProtocol,
+    PluginType,
+    call_plugin_hooks,
+    merge_openapi_schemas,
+)
 from fastapi.types import DecoratedCallable, IncEx
 from fastapi.utils import generate_unique_id
 from starlette.applications import Starlette
@@ -991,6 +999,45 @@ class FastAPI(Starlette):
         self.user_middleware: list[Middleware] = (
             [] if middleware is None else list(middleware)
         )
+        self.plugins: Annotated[
+            list[PluginType],
+            Doc(
+                """
+                A list of plugins to register with the application.
+
+                Plugins can implement lifecycle hooks (on_startup, on_shutdown,
+                before_request, after_request) and OpenAPI schema extensions.
+
+                Read more in the
+                [FastAPI docs for Plugins](https://fastapi.tiangolo.com/advanced/plugins/).
+
+                **Example**
+
+                ```python
+                from fastapi import FastAPI
+                from fastapi.plugin import Plugin
+
+                class MyPlugin(Plugin):
+                    def on_startup(self, app: FastAPI) -> None:
+                        print("Starting up!")
+
+                app = FastAPI()
+                app.plugins.append(MyPlugin())
+                ```
+                """
+            ),
+        ] = []
+        # Add plugin startup/shutdown hooks to router
+        # These hooks look up plugins at runtime to support adding plugins after init
+
+        async def run_plugin_startup():
+            await call_plugin_hooks(self, "on_startup")
+
+        async def run_plugin_shutdown():
+            await call_plugin_hooks(self, "on_shutdown")
+
+        self.router.on_startup.insert(0, run_plugin_startup)
+        self.router.on_shutdown.append(run_plugin_shutdown)
         self.middleware_stack: ASGIApp | None = None
         self.setup()
 
@@ -1073,9 +1120,24 @@ class FastAPI(Starlette):
                 separate_input_output_schemas=self.separate_input_output_schemas,
                 external_docs=self.openapi_external_docs,
             )
+            # Merge plugin OpenAPI schema extensions
+            if self.plugins:
+                plugin_schemas = []
+                for plugin in self.plugins:
+                    if hasattr(plugin, "openapi_schema"):
+                        schema = plugin.openapi_schema()
+                        if schema:
+                            plugin_schemas.append(schema)
+                if plugin_schemas:
+                    self.openapi_schema = merge_openapi_schemas(
+                        self.openapi_schema, plugin_schemas
+                    )
         return self.openapi_schema
 
     def setup(self) -> None:
+        # Add plugin middleware for before_request and after_request hooks
+        # The middleware will look up plugins from the app at runtime
+        self.add_middleware(PluginMiddleware)
         if self.openapi_url:
             urls = (server_data.get("url") for server_data in self.servers)
             server_urls = {url for url in urls if url}
