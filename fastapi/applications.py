@@ -17,6 +17,8 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
 from fastapi.logger import logger
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
+from fastapi.middleware.exceptions import MiddlewareError, OrderedMiddlewareError
+from fastapi.middleware.graph import MiddlewareConfig, MiddlewareGraph
 from fastapi.openapi.docs import (
     get_redoc_html,
     get_swagger_ui_html,
@@ -992,7 +994,93 @@ class FastAPI(Starlette):
             [] if middleware is None else list(middleware)
         )
         self.middleware_stack: ASGIApp | None = None
+        self.middleware_graph: MiddlewareGraph = MiddlewareGraph()
         self.setup()
+
+    def add_typed_middleware(
+        self,
+        middleware_class: Any,
+        *,
+        dependencies: list[Any] = [],
+        depends_on: tuple[type, ...] = (),
+        **kwargs: Any,
+    ) -> None:
+        """
+        Add a type-safe middleware to the application.
+
+        This method adds middleware that implements the MiddlewareProtocol
+        with full type safety for request/response handling.
+
+        Args:
+            middleware_class: A class implementing MiddlewareProtocol.
+            dependencies: List of Depends() instances for dependency injection.
+            depends_on: Tuple of middleware classes that must run before this one.
+            **kwargs: Additional keyword arguments passed to the middleware.
+
+        Raises:
+            OrderedMiddlewareError: If there are ordering conflicts.
+            MiddlewareError: If the middleware is invalid.
+
+        Example:
+            from fastapi import FastAPI, Depends
+            from fastapi.middleware import MiddlewareProtocol
+
+            class AuthMiddleware(MiddlewareProtocol):
+                def __init__(self, app, db=Depends(get_db)):
+                    self.app = app
+                    self.db = db
+
+                async def __call__(self, request, call_next):
+                    return await call_next(request)
+
+            app = FastAPI()
+            app.add_typed_middleware(AuthMiddleware)
+        """
+        # Validate that middleware_class is a valid class
+        if not isinstance(middleware_class, type):
+            raise MiddlewareError(
+                f"middleware_class must be a class, got {type(middleware_class).__name__}"
+            )
+
+        # Create middleware configuration
+        config = MiddlewareConfig(
+            cls=middleware_class,
+            dependencies=list(dependencies),
+            depends_on=depends_on,
+            kwargs=kwargs,
+        )
+
+        # Add to the graph (this validates ordering)
+        self.middleware_graph.add_middleware(config)
+
+        # Add to user_middleware for ASGI stack
+        from fastapi.middleware.typed import TypedMiddleware
+
+        self.user_middleware.append(
+            Middleware(TypedMiddleware, middleware_class=middleware_class, **kwargs)
+        )
+
+    async def _call_middleware_startup(self) -> None:
+        """Call startup hooks for all typed middleware."""
+        for middleware in self.user_middleware:
+            # Check if it's a TypedMiddleware
+            if hasattr(middleware, "kwargs") and "middleware_class" in middleware.kwargs:
+                mw_class = middleware.kwargs["middleware_class"]
+                # Create instance to call startup
+                instance = mw_class(middleware.kwargs.get("app", self))
+                if hasattr(instance, "on_startup"):
+                    await instance.on_startup()
+
+    async def _call_middleware_shutdown(self) -> None:
+        """Call shutdown hooks for all typed middleware."""
+        for middleware in self.user_middleware:
+            # Check if it's a TypedMiddleware
+            if hasattr(middleware, "kwargs") and "middleware_class" in middleware.kwargs:
+                mw_class = middleware.kwargs["middleware_class"]
+                # Create instance to call shutdown
+                instance = mw_class(middleware.kwargs.get("app", self))
+                if hasattr(instance, "on_shutdown"):
+                    await instance.on_shutdown()
 
     def build_middleware_stack(self) -> ASGIApp:
         # Duplicate/override from Starlette to add AsyncExitStackMiddleware
@@ -1072,8 +1160,45 @@ class FastAPI(Starlette):
                 servers=self.servers,
                 separate_input_output_schemas=self.separate_input_output_schemas,
                 external_docs=self.openapi_external_docs,
+                middleware_chain=self._get_middleware_chain_info(),
             )
         return self.openapi_schema
+
+    def _get_middleware_chain_info(self) -> list[dict[str, Any]]:
+        """
+        Extract middleware chain information for OpenAPI documentation.
+
+        Returns a list of middleware information including:
+        - Middleware class name
+        - Dependencies (depends_on)
+        - Execution order index
+        """
+        middleware_info: list[dict[str, Any]] = []
+
+        # Get execution order from middleware graph
+        try:
+            execution_order = self.middleware_graph.get_execution_order()
+        except Exception:
+            execution_order = list(self.middleware_graph.nodes.keys())
+
+        # Build info for each middleware in execution order
+        for idx, middleware_cls in enumerate(execution_order):
+            config = self.middleware_graph.get_config(middleware_cls)
+            if config:
+                info: dict[str, Any] = {
+                    "name": middleware_cls.__name__,
+                    "module": middleware_cls.__module__,
+                    "order": idx,
+                }
+                # Add depends_on information
+                if config.depends_on:
+                    info["depends_on"] = [dep.__name__ for dep in config.depends_on]
+                # Add dependencies count (not the actual dependency objects)
+                if config.dependencies:
+                    info["dependencies_count"] = len(config.dependencies)
+                middleware_info.append(info)
+
+        return middleware_info
 
     def setup(self) -> None:
         if self.openapi_url:
