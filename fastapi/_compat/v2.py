@@ -287,6 +287,34 @@ def _post_process_schema_def(schema_def: dict[str, Any]) -> None:
                 converted_examples.append({"value": v})
         schema_def["examples"] = converted_examples
 
+    # Handle example from json_schema_extra dict
+    if "json_schema_extra" in schema_def and isinstance(schema_def["json_schema_extra"], dict):
+        json_schema_extra = schema_def["json_schema_extra"]
+        # Extract single example if present and not already set
+        if "example" in json_schema_extra and "example" not in schema_def:
+            schema_def["example"] = json_schema_extra["example"]
+        # Extract multiple examples if present and not already set
+        if "examples" in json_schema_extra and "examples" not in schema_def:
+            examples_list = json_schema_extra["examples"]
+            # Convert to OpenAPI format if needed
+            if isinstance(examples_list, dict):
+                converted_examples = []
+                for v in examples_list.values():
+                    if isinstance(v, dict) and "value" in v:
+                        converted_examples.append(v)
+                    else:
+                        converted_examples.append({"value": v})
+                schema_def["examples"] = converted_examples
+            elif isinstance(examples_list, list):
+                # Convert list items to OpenAPI format
+                converted_examples = []
+                for v in examples_list:
+                    if isinstance(v, dict) and "value" in v:
+                        converted_examples.append(v)
+                    else:
+                        converted_examples.append({"value": v})
+                schema_def["examples"] = converted_examples
+
     # Handle deprecation message and replacement from json_schema_extra
     if schema_def.get("deprecated") is True:
         # Extract custom deprecation fields that Pydantic passes through
