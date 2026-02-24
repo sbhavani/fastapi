@@ -4618,6 +4618,107 @@ class FastAPI(Starlette):
 
         return decorator
 
+    def add_typed_middleware(
+        self,
+        middleware_class: Annotated[
+            type,
+            Doc(
+                """
+                A typed middleware class that inherits from BaseTypedMiddleware.
+
+                The middleware class should implement the dispatch method
+                and can use Depends() for dependency injection.
+                """
+            ),
+        ],
+        **options: Any,
+    ) -> None:
+        """
+        Add a typed middleware with dependency injection support.
+
+        This method allows adding middleware that uses FastAPI's dependency
+        injection system, providing type-safe middleware with compile-time
+        ordering validation.
+
+        Read more about it in the
+        [FastAPI docs for Typed Middleware](https://fastapi.tiangolo.com/tutorial/middleware/).
+
+        ## Example
+
+        ```python
+        from fastapi import FastAPI, Depends
+        from fastapi.middleware.typed import BaseTypedMiddleware
+        from starlette.types import ASGIApp, Receive, Send
+
+        app = FastAPI()
+
+
+        class MyMiddleware(BaseTypedMiddleware):
+            async def dispatch(
+                self,
+                scope: dict,
+                receive: Receive,
+                send: Send
+            ) -> None:
+                # Process request
+                await self.app(scope, receive, send)
+
+
+        app.add_typed_middleware(MyMiddleware)
+        ```
+
+        With dependencies:
+
+        ```python
+        from fastapi import FastAPI, Depends
+        from fastapi.middleware.typed import BaseTypedMiddleware
+
+        app = FastAPI()
+
+
+        def get_config() -> dict:
+            return {"key": "value"}
+
+
+        class MyMiddleware(BaseTypedMiddleware):
+            def __init__(
+                self,
+                app: ASGIApp,
+                config: dict = Depends(get_config)
+            ):
+                super().__init__(app)
+                self.config = config
+
+            async def dispatch(self, scope, receive, send):
+                await self.app(scope, receive, send)
+
+
+        app.add_typed_middleware(MyMiddleware)
+        ```
+        """
+        from fastapi.middleware.typed import BaseTypedMiddleware
+
+        if not isinstance(middleware_class, type):
+            raise TypeError(
+                "middleware_class must be a class, not an instance. "
+                "Use `MyMiddleware` not `MyMiddleware(app)`"
+            )
+
+        if not issubclass(middleware_class, BaseTypedMiddleware):
+            raise TypeError(
+                f"middleware_class must be a subclass of BaseTypedMiddleware, "
+                f"got {middleware_class.__name__}"
+            )
+
+        # Create middleware instance with the app
+        middleware_instance = middleware_class(self, **options)
+
+        # Add using Starlette's middleware
+        self.add_middleware(
+            type(middleware_instance),
+            dispatch=middleware_instance.dispatch,
+        )
+
     def exception_handler(
         self,
         exc_class_or_status_code: Annotated[
