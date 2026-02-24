@@ -269,6 +269,42 @@ def get_schema_from_model_field(
     return json_schema
 
 
+def _post_process_schema_def(schema_def: dict[str, Any]) -> None:
+    """Post-process a schema definition to handle examples format and deprecation."""
+    if "description" in schema_def:
+        item_description = cast(str, schema_def["description"]).split("\f")[0]
+        schema_def["description"] = item_description
+
+    # Handle examples dict format - convert to OpenAPI list format
+    if "examples" in schema_def and isinstance(schema_def["examples"], dict):
+        examples_dict = schema_def["examples"]
+        # Check if values are already in OpenAPI format (have 'value' key)
+        converted_examples = []
+        for v in examples_dict.values():
+            if isinstance(v, dict) and "value" in v:
+                converted_examples.append(v)
+            else:
+                converted_examples.append({"value": v})
+        schema_def["examples"] = converted_examples
+
+    # Handle deprecation message and replacement from json_schema_extra
+    if schema_def.get("deprecated") is True:
+        # Extract custom deprecation fields that Pydantic passes through
+        deprecation_info = schema_def.pop("deprecation_message", None)
+        replacement_info = schema_def.pop("replacement", None)
+
+        if deprecation_info or replacement_info:
+            desc_parts = []
+            if schema_def.get("description"):
+                desc_parts.append(schema_def["description"])
+            msg = "Deprecated"
+            if deprecation_info:
+                msg += f": {deprecation_info}"
+            if replacement_info:
+                msg += f". Use '{replacement_info}' instead."
+            schema_def["description"] = " | ".join(desc_parts + [msg]) if desc_parts else msg
+
+
 def get_definitions(
     *,
     fields: Sequence[ModelField],
@@ -321,10 +357,14 @@ def get_definitions(
         for field in list(fields) + list(unique_flat_model_fields)
     ]
     field_mapping, definitions = schema_generator.generate_definitions(inputs=inputs)
+    # Post-process definitions to handle examples format and deprecation
     for item_def in cast(dict[str, dict[str, Any]], definitions).values():
-        if "description" in item_def:
-            item_description = cast(str, item_def["description"]).split("\f")[0]
-            item_def["description"] = item_description
+        _post_process_schema_def(item_def)
+        # Also process nested properties
+        if "properties" in item_def and isinstance(item_def["properties"], dict):
+            for prop_def in item_def["properties"].values():
+                if isinstance(prop_def, dict):
+                    _post_process_schema_def(prop_def)
     # definitions: dict[DefsRef, dict[str, Any]]
     # but mypy complains about general str in other places that are not declared as
     # DefsRef, although DefsRef is just str:
