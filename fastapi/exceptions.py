@@ -254,3 +254,40 @@ class FastAPIDeprecationWarning(UserWarning):
     A custom deprecation warning as DeprecationWarning is ignored
     Ref: https://sethmlarson.dev/deprecations-via-warnings-dont-work-for-python-libraries
     """
+
+
+class MiddlewareError(FastAPIError):
+    """Base exception for typed middleware errors."""
+
+    pass
+
+
+class MiddlewareOrderingError(MiddlewareError):
+    """Raised when middleware ordering constraints cannot be satisfied."""
+
+    conflicting_middleware: tuple[str, str] | None
+
+    def __init__(
+        self,
+        message: str,
+        conflicting_middleware: tuple[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.conflicting_middleware = conflicting_middleware
+
+
+class MiddlewareDependencyError(MiddlewareError):
+    """Raised when middleware dependencies cannot be resolved."""
+
+    middleware: str | None
+    missing_dependencies: Sequence[str]
+
+    def __init__(
+        self,
+        message: str,
+        middleware: str | None = None,
+        missing_dependencies: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.middleware = middleware
+        self.missing_dependencies = list(missing_dependencies) if missing_dependencies else []

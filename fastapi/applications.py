@@ -14,7 +14,21 @@ from fastapi.exception_handlers import (
     request_validation_exception_handler,
     websocket_request_validation_exception_handler,
 )
-from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
+from fastapi.exceptions import (
+    MiddlewareDependencyError,
+    MiddlewareError,
+    MiddlewareOrderingError,
+    RequestValidationError,
+    WebSocketRequestValidationError,
+)
+from fastapi.middleware.typed import (
+    ConstructorParam,
+    DependencyContainer,
+    MiddlewareContext,
+    MiddlewareProtocol,
+    MiddlewareRegistration,
+    validate_ordering_constraints,
+)
 from fastapi.logger import logger
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
 from fastapi.openapi.docs import (
@@ -4617,6 +4631,129 @@ class FastAPI(Starlette):
             return func
 
         return decorator
+
+    def _validate_middleware_dependencies(
+        self,
+        registration: MiddlewareRegistration[Any, Any],
+        container: DependencyContainer[Any],
+    ) -> None:
+        """Validate that middleware dependencies can be resolved.
+
+        This checks at registration time that all constructor parameters
+        can be satisfied either via the container or with default values.
+
+        Raises:
+            MiddlewareDependencyError: If a dependency cannot be resolved
+        """
+        from fastapi.middleware.typed import MiddlewareDependencyError
+
+        for param in registration.constructor_params:
+            # Skip parameters with defaults
+            if param.has_default:
+                continue
+
+            # Skip explicit Depends with dependency functions (they'll be called at instantiation)
+            if param.is_depends and param.depends_dependency is not None:
+                continue
+
+            # Check if it's in the container
+            if not container.has(param.type):
+                raise MiddlewareDependencyError(
+                    f"Cannot resolve dependency '{param.name}' of type {param.type} "
+                    f"for middleware '{registration.name}'. Either register it with "
+                    f"dependency_overrides or provide a default value.",
+                    middleware=registration.name,
+                    missing_dependencies=[param.name],
+                )
+
+    def add_typed_middleware(
+        self,
+        middleware_class: type[MiddlewareProtocol[Any, Any]],
+        *,
+        priority: int = 0,
+        before: Sequence[str] | None = None,
+        after: Sequence[str] | None = None,
+        name: str | None = None,
+    ) -> None:
+        """
+        Register a typed middleware with ordering constraints.
+
+        Read more about it in the
+        [FastAPI docs for Typed Middleware](https://fastapi.tiangolo.com/advanced/middleware/#typed-middleware).
+
+        ## Example
+
+        ```python
+        from typing import Protocol
+        from fastapi import FastAPI
+        from fastapi.middleware.typed import MiddlewareContext, priority
+
+        class MyMiddleware(Protocol):
+            async def dispatch(
+                self,
+                context: MiddlewareContext[Request, Response]
+            ) -> Response:
+                # Process request and return response
+                ...
+
+        app = FastAPI()
+        app.add_typed_middleware(MyMiddleware, priority=100)
+        ```
+        """
+        from fastapi.middleware.typed import (
+            ConstructorParam,
+            DependencyContainer,
+            MiddlewareRegistration,
+            extract_constructor_params,
+            instantiate_middleware,
+        )
+
+        if before is None:
+            before = []
+        if after is None:
+            after = []
+
+        # Extract ordering constraints from class decorators
+        class_priority = getattr(middleware_class, "__middleware_priority__", priority)
+        class_before = getattr(middleware_class, "__middleware_before__", [])
+        class_after = getattr(middleware_class, "__middleware_after__", [])
+
+        # Merge class-level and runtime-level constraints
+        final_before = list(class_before) + list(before)
+        final_after = list(class_after) + list(after)
+
+        # Create dependency container
+        container = DependencyContainer[Any]()
+
+        # Extract constructor parameters for dependency injection
+        constructor_params = extract_constructor_params(middleware_class)
+
+        # Create registration
+        registration = MiddlewareRegistration(
+            middleware_class=middleware_class,
+            constructor_params=constructor_params,
+            priority=class_priority,
+            before=final_before,
+            after=final_after,
+            name=name,
+            dependency_container=container,
+        )
+
+        # Validate that all dependencies can be resolved
+        self._validate_middleware_dependencies(registration, container)
+
+        # Validate ordering constraints
+        try:
+            validate_ordering_constraints(
+                self._typed_middleware_registry,  # type: ignore[attr-defined]
+                registration,
+            )
+        except AttributeError:
+            # First middleware being registered
+            self._typed_middleware_registry = {}  # type: ignore[attr-defined]
+
+        # Add to registry
+        self._typed_middleware_registry[registration.name] = registration  # type: ignore[index]
 
     def exception_handler(
         self,
