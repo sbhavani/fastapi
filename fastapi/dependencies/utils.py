@@ -1022,3 +1022,209 @@ def get_body_field(
 def get_validation_alias(field: ModelField) -> str:
     va = getattr(field, "validation_alias", None)
     return va or field.alias
+
+
+def get_middleware_dependant(
+    *,
+    middleware_class: type,
+    name: str | None = None,
+) -> Dependant:
+    """
+    Create a Dependant from a middleware class's __init__ method.
+
+    This extracts dependencies declared in the middleware's __init__ method
+    using FastAPI's Depends() annotation, allowing middleware to use
+    FastAPI's dependency injection system.
+
+    Args:
+        middleware_class: The middleware class to analyze.
+        name: Optional name for the dependant.
+
+    Returns:
+        A Dependant representing the middleware's dependencies.
+    """
+    # Get the __init__ method
+    init_method = getattr(middleware_class, "__init__", None)
+    if init_method is None:
+        return Dependant(call=middleware_class, name=name, path="/middleware")
+
+    # Create a callable that represents the __init__ for dependency analysis
+    # We use a wrapper to properly analyze the signature
+    def get_init_call() -> type:
+        return middleware_class
+
+    dependant = Dependant(
+        call=get_init_call,
+        name=name,
+        path="/middleware",
+        use_cache=False,  # Middleware deps are solved once at startup
+    )
+
+    # Get the signature of __init__
+    try:
+        init_signature = _get_signature(init_method)
+    except (ValueError, TypeError):
+        return dependant
+
+    signature_params = init_signature.parameters
+
+    for param_name, param in signature_params.items():
+        if param_name in ("self", "app"):
+            continue
+
+        # Check if parameter has a Depends default
+        if param.default is not inspect.Parameter.empty:
+            if isinstance(param.default, params.Depends):
+                # This is a dependency
+                dep = param.default
+                sub_dependant = get_dependant(
+                    path="/middleware",
+                    call=dep.dependency,
+                    name=param_name,
+                    use_cache=dep.use_cache,
+                    scope=dep.scope,
+                )
+                dependant.dependencies.append(sub_dependant)
+                continue
+
+        # Check for Annotated with Depends
+        if param.annotation is not inspect.Parameter.empty:
+            origin = get_origin(param.annotation)
+            if origin is Annotated:
+                annotated_args = get_args(param.annotation)
+                for arg in annotated_args[1:]:
+                    if isinstance(arg, params.Depends):
+                        dep = arg
+                        sub_dependant = get_dependant(
+                            path="/middleware",
+                            call=dep.dependency,
+                            name=param_name,
+                            use_cache=dep.use_cache,
+                            scope=dep.scope,
+                        )
+                        dependant.dependencies.append(sub_dependant)
+                        break
+
+    return dependant
+
+
+async def solve_middleware_dependencies(
+    *,
+    middleware_dependant: Dependant,
+    dependency_overrides_provider: Any | None = None,
+    dependency_cache: dict[DependencyCacheKey, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Solve dependencies for a middleware.
+
+    This resolves the dependencies declared in a middleware's __init__ method.
+    Unlike route dependencies which are solved per-request, middleware
+    dependencies are solved once at application startup.
+
+    Args:
+        middleware_dependant: The Dependant representing middleware dependencies.
+        dependency_overrides_provider: Optional provider for dependency overrides.
+        dependency_cache: Optional cache for solved dependencies.
+
+    Returns:
+        A dictionary of resolved dependency values.
+
+    Raises:
+        Any exceptions from dependency resolution.
+    """
+    from contextlib import AsyncExitStack
+
+    if dependency_cache is None:
+        dependency_cache = {}
+
+    values: dict[str, Any] = {}
+
+    # Create a minimal async exit stack for middleware
+    async with AsyncExitStack() as stack:
+        # Solve each dependency recursively
+        for sub_dependant in middleware_dependant.dependencies:
+            sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
+            call = sub_dependant.call
+
+            # Apply dependency overrides
+            if (
+                dependency_overrides_provider
+                and dependency_overrides_provider.dependency_overrides
+            ):
+                original_call = sub_dependant.call
+                call = getattr(
+                    dependency_overrides_provider, "dependency_overrides", {}
+                ).get(original_call, original_call)
+
+            # Recursively solve sub-dependencies
+            sub_values = await solve_middleware_dependencies(
+                middleware_dependant=sub_dependant,
+                dependency_overrides_provider=dependency_overrides_provider,
+                dependency_cache=dependency_cache,
+            )
+
+            # Check cache
+            if sub_dependant.use_cache and sub_dependant.cache_key in dependency_cache:
+                solved = dependency_cache[sub_dependant.cache_key]
+            elif sub_dependant.is_async_gen_callable:
+                from fastapi.concurrency import asynccontextmanager
+
+                cm = asynccontextmanager(call)(**sub_values)
+                solved = await stack.enter_async_context(cm)
+            elif sub_dependant.is_gen_callable:
+                from contextlib import contextmanager
+                from fastapi.concurrency import contextmanager_in_threadpool
+
+                cm = contextmanager(call)(**sub_values)
+                solved = await stack.enter_async_context(
+                    contextmanager_in_threadpool(cm)
+                )
+            elif sub_dependant.is_coroutine_callable:
+                solved = await call(**sub_values)
+            else:
+                from starlette.concurrency import run_in_threadpool
+
+                solved = await run_in_threadpool(call, **sub_values)
+
+            if sub_dependant.name is not None:
+                values[sub_dependant.name] = solved
+
+            if sub_dependant.cache_key not in dependency_cache:
+                dependency_cache[sub_dependant.cache_key] = solved
+
+    return values
+
+
+def solve_middleware_dependencies_sync(
+    *,
+    middleware_dependant: Dependant,
+    dependency_overrides_provider: Any | None = None,
+    dependency_cache: dict[DependencyCacheKey, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Synchronously solve dependencies for a middleware.
+
+    This is a synchronous wrapper around solve_middleware_dependencies that
+    runs the async resolution using asyncio.run(). This is suitable for
+    resolving middleware dependencies at application startup.
+
+    Args:
+        middleware_dependant: The Dependant representing middleware dependencies.
+        dependency_overrides_provider: Optional provider for dependency overrides.
+        dependency_cache: Optional cache for solved dependencies.
+
+    Returns:
+        A dictionary of resolved dependency values.
+
+    Raises:
+        Any exceptions from dependency resolution.
+    """
+    import asyncio
+
+    return asyncio.run(
+        solve_middleware_dependencies(
+            middleware_dependant=middleware_dependant,
+            dependency_overrides_provider=dependency_overrides_provider,
+            dependency_cache=dependency_cache,
+        )
+    )

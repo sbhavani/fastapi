@@ -492,6 +492,7 @@ def get_openapi(
     license_info: dict[str, str | Any] | None = None,
     separate_input_output_schemas: bool = True,
     external_docs: dict[str, Any] | None = None,
+    middleware_chain: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     info: dict[str, Any] = {"title": title, "version": version}
     if summary:
@@ -561,6 +562,9 @@ def get_openapi(
         components["schemas"] = {k: definitions[k] for k in sorted(definitions)}
     if components:
         output["components"] = components
+    # Add middleware chain information as an OpenAPI extension
+    if middleware_chain:
+        output["x-middleware-chain"] = middleware_chain
     output["paths"] = paths
     if webhook_paths:
         output["webhooks"] = webhook_paths
